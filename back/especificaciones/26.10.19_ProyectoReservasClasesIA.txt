@@ -1,0 +1,249 @@
+Vamos a desarrollar un módulo simple de reserva de clases con profesores de IA, para una prueba técnica.
+
+# Objetivo
+Construir un flujo funcional de punta a punta: listar profesores, consultar sus perfiles y horarios, reservar una clase y ver las próximas clases del alumno.
+
+Stack propuesto:
+- Backend: Django + Django REST Framework.
+- Base de datos: SQLite (suficiente para la prueba).
+- Interfaz: HTML/CSS/JavaScript sencillos, por ejemplo con templates de Django. Si se utiliza otro frontend, consumiría los mismos endpoints.
+- No implementar autenticación, pagos ni videollamadas.
+
+# Requisitos funcionales
+
+## 1. Profesores
+- Mostrar un listado de profesores de IA.
+- Permitir consultar el detalle de cada profesor: nombre, descripción, especialidades y horarios disponibles.
+- Mostrar únicamente horarios futuros que todavía no tengan una reserva.
+
+## 2. Reserva de clases
+- Permitir elegir un horario disponible de un profesor.
+- Confirmar la reserva para un alumno identificado en esta demo.
+- Crear la reserva directamente en estado "confirmada" (no habrá un estado pendiente ni pagos).
+- Mostrar un mensaje de éxito con profesor, fecha y hora.
+- Impedir que dos alumnos reserven un mismo horario, incluso si envían la solicitud casi simultáneamente.
+- Una vez reservado, el horario deja de aparecer como disponible.
+
+## 3. Próximas clases
+- Mostrar las reservas futuras del alumno de demo, ordenadas por fecha y hora.
+- Incluir profesor, especialidad si resulta útil, fecha, hora y estado de la reserva.
+- No mostrar en esta sección clases que ya pasaron.
+
+## 4. Validaciones y errores
+- No se puede reservar un horario inexistente, pasado o ya reservado.
+- No se puede crear una reserva sin identificar al alumno.
+- No se puede reservar para un alumno inexistente.
+- No se pueden crear dos horarios con el mismo inicio para un mismo profesor.
+- Mostrar errores claros en la interfaz; no dejar que una falla del backend produzca una confirmación falsa.
+
+--MODELOS--
+
+(a) Profesor
+- Campos
+    - uuid (UUID único)
+    - nombre (string obligatorio)
+    - descripcion (text, opcional)
+    - especialidades (string o text; separadas por comas para simplificar)
+    - is_active (boolean, default True)
+    - fecha_create y fecha_update
+
+- Métodos / properties
+    - __str__: devolver [nombre]
+    - horarios_disponibles: obtener sus horarios futuros, activos y sin reserva; ordenados por inicio
+
+- Notas
+    - No se desarrollará un CRUD de profesores. Se cargarán profesores de ejemplo desde Django Admin o un comando de datos iniciales.
+
+(b) Horario
+- Campos
+    - uuid (UUID único)
+    - profesor (FK a Profesor)
+    - inicio (DateTimeField: fecha y hora de inicio)
+    - duracion_minutos (entero positivo, default 60)
+    - is_active (boolean, default True)
+    - fecha_create y fecha_update
+
+- Restricciones
+    - UniqueConstraint sobre (profesor, inicio), para no duplicar horarios de un profesor.
+    - Guardar fechas con zona horaria habilitada (USE_TZ = True).
+
+- Properties / métodos
+    - disponible: True si está activo, su inicio es futuro y no existe una reserva asociada.
+    - __str__: [profesor] + [inicio]
+
+- Notas
+    - El horario representa un turno concreto, no una regla de recurrencia semanal.
+    - No se implementarán altas o cambios de horarios desde la interfaz del alumno.
+    - La verificación de disponibilidad vuelve a hacerse al confirmar la reserva; no alcanza con la información que vio el frontend.
+
+(c) Alumno
+- Campos
+    - uuid (UUID único)
+    - nombre (string obligatorio)
+    - email (EmailField; único)
+    - fecha_create
+
+- Métodos
+    - __str__: devolver [nombre]
+
+- Notas
+    - Como la autenticación está fuera de alcance, se creará un alumno de demo y la interfaz operará con su UUID.
+    - No se implementará registro, inicio de sesión ni administración de alumnos.
+
+(d) Reserva
+- Campos
+    - uuid (UUID único)
+    - alumno (FK a Alumno)
+    - horario (OneToOneField a Horario)
+    - estado (choices -> "confirmada"; único estado implementado en esta versión)
+    - fecha_create
+
+- Restricciones
+    - Un horario puede tener, como máximo, una reserva. El OneToOneField debe imponer esa restricción en la base de datos.
+    - El profesor, la fecha y la hora se obtienen a través de horario; no duplicar esos datos en Reserva.
+
+- Métodos
+    - __str__: [alumno] + [profesor] + [inicio] + [estado]
+    - crear / confirmar (si se utiliza un método de dominio): registrar una reserva válida en estado "confirmada".
+
+- Notas
+    - La cancelación y la reprogramación quedan fuera de esta versión. Así, un horario reservado nunca se libera y no se necesita lógica adicional de estados.
+
+Observaciones generales de los modelos:
+    - Todos poseen UUID.
+    - No crear tablas adicionales de especialidades, pagos ni videollamadas.
+    - Se utilizarán algunos profesores, horarios futuros y un alumno de demo para probar el flujo.
+    - No se agregarán logs de auditoría en esta etapa.
+
+--VISTAS + SERVICES + SERIALIZERS--
+
+Vistas de API (Django REST Framework):
+
+    - ProfesorListView.get
+        - GET /api/profesores/
+        - Devuelve profesores activos (uuid, nombre, especialidades y breve descripción).
+
+    - ProfesorDetailView.get
+        - GET /api/profesores/<uuid:profesor_uuid>/
+        - Devuelve el perfil y sus horarios disponibles (uuid, inicio y duración).
+        - Si el profesor no existe o no está activo: 404.
+
+    - ReservaCrearView.post
+        - POST /api/horarios/<uuid:horario_uuid>/reservar/
+        - Body esperado:
+            {
+                "alumno_id": "<uuid del alumno de demo>"
+            }
+        - Valida los datos y solicita al service la creación de la reserva.
+        - Éxito: 201, con uuid de la reserva, profesor, fecha, hora y estado "confirmada".
+        - Horario ya reservado: 409 con mensaje comprensible.
+        - Horario pasado o inactivo: 400.
+        - Alumno_id faltante o inválido: 400.
+        - Alumno u horario inexistente: 404.
+
+    - AlumnoReservasView.get
+        - GET /api/alumnos/<uuid:alumno_uuid>/reservas/
+        - Devuelve solo las próximas clases del alumno, ordenadas por inicio.
+        - Cada registro contiene uuid de reserva, profesor, fecha, hora y estado.
+        - Alumno inexistente: 404.
+
+Services:
+    - listar_profesores
+    - obtener_detalle_profesor_y_horarios
+    - crear_reserva
+        - Identifica alumno y horario.
+        - Verifica que el horario siga disponible.
+        - Crea la reserva dentro de transaction.atomic().
+        - Captura violaciones de unicidad (IntegrityError) y responde con error de horario ocupado.
+        - La restricción OneToOne en base de datos es la protección final contra reservas simultáneas.
+    - listar_proximas_reservas_alumno
+
+Serializers:
+    - ProfesorListSerializer (salida)
+    - ProfesorDetailSerializer / HorarioDisponibleSerializer (salida)
+    - ReservaCrearSerializer (entrada: alumno_id obligatorio)
+    - ReservaDetailSerializer (salida: reserva, profesor, fecha, hora, estado)
+    - AlumnoReservasSerializer (salida)
+
+Distribución de responsabilidades:
+    - Vistas -> Reciben solicitudes, validan entrada mediante serializers, llaman a los services y devuelven respuestas HTTP.
+    - Services -> Ejecutan consultas y lógica de negocio; usan métodos/properties de los modelos cuando corresponda.
+    - Serializers -> Validan formato de entrada y preparan datos de salida.
+    - Modelos -> Definen estructura, restricciones de integridad y comportamiento propio de cada entidad.
+    - Cuando corresponda, las vistas pasan validated_data completo al service, sin reconstruir sus campos uno por uno.
+    - Los UUID que identifican recursos a consultar o reservar viajan por las URLs. El alumno_id viaja en el body de la creación, porque es un dato de la reserva.
+
+--INTERFAZ--
+
+Pantalla / sección 1: Profesores
+    - Lista simple de profesores con nombre y especialidades.
+    - Acción "Ver horarios" o selección del profesor.
+
+Pantalla / sección 2: Perfil y reserva
+    - Nombre, descripción, especialidades y horarios disponibles.
+    - Elegir un horario y pulsar "Reservar".
+    - Mostrar confirmación con profesor, fecha y hora.
+    - Si el horario se ocupó entretanto, mostrar un error y actualizar los disponibles.
+    - Si no hay horarios libres, mostrar un estado vacío claro.
+
+Pantalla / sección 3: Mis próximas clases
+    - Lista de reservas futuras del alumno de demo.
+    - Mostrar profesor, fecha, hora y estado de cada una.
+    - Mostrar un mensaje si todavía no tiene clases programadas.
+
+Notas de interfaz:
+    - Puede resolverse con una única página y secciones; no hace falta diseño complejo.
+    - Estados básicos: cargando, éxito, error y lista vacía.
+    - El frontend nunca debe decidir por sí solo si una reserva es válida; debe atender la respuesta del backend.
+
+--ESTRUCTURA--
+
+- Crear una app Django llamada reservas.
+- Usar models.py y urls.py dentro de la app.
+- Organizar vistas, services y serializers en sus respectivas carpetas, respetando la estructura de carpetas ya dadas.
+- Usar templates/ y static/ si se hace la interfaz en Django.
+- Preparar un comando de carga de datos de demo (manage.py cargar_demo), o una alternativa igualmente sencilla que permita probar el sistema.
+- Crear tests.py o una carpeta tests/ para las pruebas esenciales.
+- Crear README.md en la raíz del proyecto.
+
+--PRUEBAS MÍNIMAS--
+
+(1) Listar profesores y consultar horarios libres.
+(2) Crear correctamente una reserva y recibir 201.
+(3) Comprobar que el horario reservado desaparezca de los disponibles.
+(4) Intentar reservar nuevamente el mismo horario y obtener 409; no crear una segunda reserva.
+(5) Rechazar horarios pasados o inactivos.
+(6) Rechazar un alumno_id ausente o inválido.
+(7) Mostrar únicamente reservas futuras del alumno correcto, con profesor, fecha, hora y estado.
+(8) Verificar la restricción de unicidad de (profesor, inicio) y de Reserva.horario.
+
+--README--
+
+Incluir:
+    - Descripción del módulo y alcance.
+    - Requisitos de entorno y stack utilizado.
+    - Instalación de dependencias y configuración.
+    - Migraciones y comando para cargar datos de demo.
+    - Comandos para iniciar backend/interfaz y ejecutar tests.
+    - Flujo de uso y funcionalidades implementadas.
+    - Endpoints disponibles y ejemplos de solicitudes.
+    - Decisiones técnicas (modelo Horario, reserva OneToOne, transacción, alumno de demo).
+    - Uso de IA: qué herramientas se utilizaron, para qué y qué se revisó manualmente.
+    - Limitaciones conocidas y posibles mejoras (autenticación, cancelación, reprogramación, pagos, videollamadas, control de solapamientos entre horarios con distinto inicio, y manejo de concurrencia en una base productiva).
+
+--PASOS--
+
+(0) Crear proyecto Django, app reservas, instalar/configurar DRF y definir README inicial.
+(1) Crear modelos: Profesor, Horario, Alumno y Reserva; generar/aplicar migraciones.
+(2) Crear datos de demo: profesores, sus horarios futuros y alumno de prueba.
+(3) Crear serializers, services, vistas y URLs de profesores:
+    - ProfesorListView.get
+    - ProfesorDetailView.get
+(4) Crear serializers, services, vistas y URLs de reservas:
+    - ReservaCrearView.post
+    - AlumnoReservasView.get
+(5) Crear la interfaz mínima y conectar el flujo completo.
+(6) Escribir y ejecutar las pruebas mínimas; corregir errores detectados.
+(7) Completar README, verificar la ejecución desde cero y preparar la entrega.
+
+Prioridad: si el tiempo es limitado, terminar primero el flujo completo de reserva y "Mis próximas clases". No invertir tiempo en CRUDs administrativos ni funcionalidades fuera de la consigna.
